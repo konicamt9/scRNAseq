@@ -1,0 +1,128 @@
+library(Seurat)
+library(hdf5r)
+library(dplyr)
+library(DoubletFinder)
+library(patchwork)
+library(ggplot2)
+library(Matrix)
+library(KernSmooth)
+library(ROCR)
+library(parallel)
+library(SeuratData)
+library(UCell)
+library(tidyverse)
+library(magrittr)
+library(liana)
+library(circlize)
+library(furrr)
+library(future)
+
+
+setwd("~/Library/Mobile Documents/com~apple~CloudDocs/Master 2 /scRNAseq")
+
+data <- Read10X_h5("./data/GSM5538777_MF17raw_feature_bc_matrix.h5")
+
+seurat_obj <- CreateSeuratObject(counts = data, project = "MF17")
+
+### PRE PROCESSING OF DATA ###
+## Step 1 : keep cells expressing at least 200 genes and filter according mt genes (<20%)
+# reveal mt genes stats
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+# filtering cells
+seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 200 & percent.mt < 20 & nCount_RNA > 500)
+# QC metrics as Violin plots
+VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+## Step 2 : cut-off of 2000 highly variable genes and plot PCA 
+# Normalisation des données
+seurat_obj <- NormalizeData(seurat_obj)
+# Détection des 2000 gènes les plus variables
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+# Mise à l'échelle des données
+seurat_obj <- ScaleData(seurat_obj, features = rownames(seurat_obj))
+# PCA avec 40 composantes principales
+seurat_obj <- RunPCA(seurat_obj, npcs = 40, verbose = FALSE)
+# Visualisation des PCs
+ElbowPlot(seurat_obj, ndims = 40)
+
+### Downstream analysis ###
+## Louvain clustering (K=10 / pcs=40 / resolution 0.4)
+# Construction du graphe des voisins
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:40, k.param = 10)
+# Clustering Louvain
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.4)
+# Affichage des clusters
+DimPlot(seurat_obj, reduction = "pca", group.by = "seurat_clusters")
+
+
+## Visualization (UMAP/tSNE)
+# UMAP
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:40)
+DimPlot(seurat_obj, reduction = "umap", label = TRUE)
+# t-SNE
+seurat_obj <- RunTSNE(seurat_obj, dims = 1:40)
+DimPlot(seurat_obj, reduction = "tsne", label = TRUE)
+
+
+
+## Identify cell types 
+# Trouver les marqueurs différentiels par cluster
+markers <- FindAllMarkers(seurat_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.1)
+# Filtrer par p-value < 0.05
+markers <- markers[markers$p_val_adj < 0.05, ]
+# Voir les top marqueurs de chaque cluster
+head(markers)
+
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)  # Sélectionne les 10 gènes avec le plus grand Log2FC
+
+top_genes <- top_markers$gene  # Extraire les noms des gènes
+DoHeatmap(seurat_obj, features = top_genes) + NoLegend()
+
+### Annotate w/ Clacla method : 
+signatures <- list(
+  KC <- c("KRT1", "KRT5", "KRT6A", "KRT10", "KRT14", "KRT15"),
+  EC_PC <- c("VWF", "CDH5", "RGS5"),
+  pericytes <- c("RGS5"),
+  secretory_cells <- c("SCGB1B2P"),
+  FB <- c("COL1A1", "COL1A2", "COL4A1", "DCN", "FBN1", "MFAP5", "CCL19", 
+          "CXCL9", "POSTN", "CCL2", "COL6A5", "COL18A1", "CCL19"),
+  melanocytes <- c("PMEL", "MLANA"),
+  nervous_cells <- c("GFRA3"),
+  macrophages <- c("CD68", "CD163", "AIF1", "CCL18", "CPVL"),
+  DC <- c("CD1C", "ITGAX", "LAMP3", "LYZ", "IL1B"),
+  mast_cells <- c("TPSAB1"),
+  T_cells <- c("CD3D"),
+  CD4 <- c("CD3D", "CD3E"),
+  CD4_malign <- c("CCR4", "KIR3DL2" ,"IGFL2", "HACD1",
+                  "SESN3", "PGM2L1", "KLHL42", "GIMAP7", "GIMAP4"),
+  T_reg <- c("FOXP3", "CTLA4", "IL2RA"),
+  NK <- c("KLRB1", "KLRD1"),
+  CD8 <- c("CD8A", "CD8B", "GZMA"),
+  LB <- c("MS4A1", "CD79A", "IGHG1")
+)
+
+
+# Calculate module enrichment scores with the genes in the list we did
+seurat_obj <- AddModuleScore_UCell(seurat_obj, 
+                                  features=signatures, name=NULL)
+seurat_obj <- AddModuleScore_UCell(
+  seurat_obj,
+  features = signatures,
+  maxRank = 1500,
+  chunk.size = 1000,
+  BPPARAM = NULL,
+  ncores = 1,
+  storeRanks = FALSE,
+  w_neg = 1,
+  assay = NULL,
+  slot = "counts",
+  ties.method = "average",
+  force.gc = FALSE,
+  name = "_UCell"
+)
+
+# Vizualisation of specific genes in the dataset
+FeaturePlot(seurat_obj, reduction = "umap", features = CD4_malign)
+
