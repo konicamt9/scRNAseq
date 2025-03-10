@@ -1,0 +1,524 @@
+#Setting up the working directory where the files of interest are
+setwd("~/M2/bioinf/02_data")
+
+#Installation of the needed packages (To do the first time only)
+# Check if BiocManager is installed, if not, install it
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+install.packages("dplyr") #Allow better data manipulation
+install.packages("Seurat") #Needed to manipulate single cell data
+install.packages("patchwork")#Allow to display several ggplot on the same graph
+install.packages("remotes") #Packages installation from GitHub 
+install.packages("Matrix") #Allow efficient handling of sparse and dense matrices (Needed for DoubletFinder)
+install.packages("KernSmooth") # For kernel smoothing functions (Needed for DoubletFinder)
+install.packages("ROCR") # For visualizing classifier performance (Needed for DoubletFinder)
+install.packages("fields") # For spatial data (Needed for DoubletFinder)
+install.packages("parallel") # For parallel computing capabilities (Needed for DoubletFinder)
+
+# Package for doublet detection in single-cell RNA sequencing data
+remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
+# For accessing additional datasets and resources for Seurat
+devtools::install_github('satijalab/seurat-data')
+# Package for ligand-receptor interaction analysis
+remotes::install_github('saezlab/liana')
+# Package for cell scoring and ranking in single-cell RNA sequencing data
+BiocManager::install("UCell")
+# Check if circlize is installed, if not, install it from a specified repository
+#Circlize allow to do chordplot
+if(!require("circlize")){
+  install.packages("circlize", quiet = TRUE,
+                   repos = "http://cran.us.r-project.org")
+}
+
+#Loading of the previously installed packages to be able to use them (To do when you start a new R session)
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(DoubletFinder)
+library(Matrix)
+library(KernSmooth)
+library(ROCR)
+library(parallel)
+library(SeuratData)
+library(UCell)
+library(tidyverse)
+library(magrittr)
+library(liana)
+library(circlize)
+library(furrr)
+library(future)
+
+#Creation of a list with all the files listed in another file 
+#Each folder in the folder contains 3 files needed to create a seurat object
+# 3 folders are : genes, barcodes and matrix
+folders <- list.files('GSE207204_RAW/', full.names = TRUE)
+
+#Creation of an empty list to put all the object into it
+seurat_objects <- list()
+
+#Loop to generate all the seurat object corresponding to each folder
+for (folder in folders){
+  #Function that needs and reads the 3 files presents in the folder
+  seurat_obj <- Read10X(data.dir = folder)
+  #Creation of the seurat object
+  seurat_obj <- CreateSeuratObject(counts = seurat_obj$`Gene Expression`, 
+                                   assay = "RNA",
+                                   project = folder)
+  #Putting all the seurat objects in the list created before the loop
+  seurat_objects[[folder]] <- seurat_obj 
+} 
+
+# Define a list of samples and a list of the sample type
+samples <- c("D1", "D2", "D3", "D4", "D5")
+sample_types <- c("APCenriched", "CD45depleted", "unenriched")
+
+# Loop to generate all the files in R environment  
+for (sample in samples) { 
+  for (sample_type in sample_types) {
+    # Extract the corresponding Seurat object
+    seurat_obj <- seurat_objects[[paste0("GSE207204_RAW/", sample, "_", 
+                                         sample_type)]]
+    
+    # Assign the Seurat object to a new variable with a shorter name
+    assign(paste0(sample, "_", sample_type), seurat_obj)
+  }
+}
+
+
+#Function saving every plot generated in a pdf file in the computer
+plots <- function(plot_obj, file_name) {
+  # Save the plot object to a PDF file
+  pdf(file_name)
+  print(plot_obj)
+  dev.off()
+}
+
+#Function for quality control
+process_seurat_objects_all <- function(seurat_objects) {
+  # Create an empty list to store the cleaned Seurat objects
+  cleaned_seurat_list <- list()
+  
+  for (sample in samples) {
+    for (sample_type in sample_types) {
+      # Extract the corresponding Seurat object
+      seurat_obj <- seurat_objects[[paste0("GSE207204_RAW/", sample, "_",
+                                           sample_type)]]
+      
+      # Assign the Seurat object to a new variable with a shorter name
+      assign(paste0(sample, "_", sample_type), seurat_obj)
+      
+      # QC part of the samples before putting them together in a big seurat object
+      # Add a column to store the percentage of mitochondrial genes
+      seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+      
+      # Subset cells without the cells dying/doublets/multiplets/empty droplets
+      seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 200 & 
+                             nFeature_RNA < 2500 & percent.mt < 5 &
+                             nCount_RNA > 500)
+      
+      # Visualize QC results 
+      vln_plot <- VlnPlot(seurat_obj, features = c("nFeature_RNA", 
+                                                   "nCount_RNA", "percent.mt"),
+                          ncol = 3, pt.size = 0)
+      plots(vln_plot, paste0(sample, "_", sample_type, "_VlnPlot.pdf"))
+      
+      # Preprocess the Seurat object
+      # Normalizing the data to transform the raw counts to log-transformed counts
+      seurat_obj <- NormalizeData(seurat_obj)
+      #Identifying the 2000 most variable features (genes)
+      seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst",
+                                         nfeatures = 2000)
+      # Scaling the data to center the expression of each gene 
+      seurat_obj <- ScaleData(seurat_obj)
+      # Performing Principal Component Analysis(dimension reduction)
+      seurat_obj <- RunPCA(seurat_obj)
+      # Running UMAP (dimension reduction)
+      seurat_obj <- RunUMAP(seurat_obj, dims = 1:10)
+      # Creating a UMAP plot of the data with labels for the clusters
+      umap_plot <- DimPlot(seurat_obj, reduction = "umap", label = TRUE,
+                           label.size = 3.5, repel = TRUE)
+      # Saving the plot into pdf file
+      plots(umap_plot, paste0(sample, "_", sample_type, "_UMAP.pdf"))
+      # Running t-SNE
+      seurat_obj <- RunTSNE(seurat_obj, reduction = "pca", cells = NULL,
+                            dims = 1:5, features = NULL, seed.use = 1,
+                            tsne.method = "Rtsne", dim.embed = 2, 
+                            distance.matrix = NULL, reduction.name = "tsne",
+                            reduction.key = "tSNE_")
+      
+      # Perform doublet detection
+      # Parametric sweep for optimal pK selection for doublet detection using 10 principal components
+      sweep.res <- paramSweep(seurat_obj, PCs = 1:10, sct = FALSE)
+      # Summarize the results of the parametric sweep
+      sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+      # Find the optimal pK value for doublet detection
+      bcmvn <- find.pK(sweep.stats)
+      bcmvn <- as.numeric(as.character(bcmvn$pK))
+      
+      # Extract cell type annotations from the Seurat object metadata
+      annotations <- seurat_obj@meta.data$CellType.sum1
+      # Model the proportion of homotypic doublets based on annotations
+      homotypic.prop <- modelHomotypic(annotations)
+      # Calculate the expected number of doublets (1% of total cells)
+      nExp_poi <- round(0.01 * (nrow(seurat_obj)))
+      # Adjust the expected number of doublets by the homotypic proportion
+      nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+      
+      # Run DoubletFinder to identify doublets using 20 principal components
+      doublet_obj <- doubletFinder(seurat_obj, PCs = 1:20, pN = 0.20,
+                                   pK = 0.01, nExp = nExp_poi,
+                                   reuse.pANN = FALSE , sct = FALSE)
+      # Create a UMAP plot to visualize doublet classifications
+      doublet_plot <- DimPlot(doublet_obj, pt.size = 1, label = TRUE,
+                              label.size = 5, reduction = "umap", 
+                              group.by = "DF.classifications_0.2_0.01_366") + theme(aspect.ratio = 1)
+      # Save the doublet plot into pdf file
+      plots(doublet_plot, paste0(sample, "_", sample_type, "_DoubletPlot.pdf"))
+      
+      # Subset the Seurat object to retain only singlet cells based on doublet classification
+      seu_clean <- subset(doublet_obj, cells = rownames(doublet_obj@meta.data)
+                          [which(doublet_obj@meta.data$DF.classification == "Singlet")])
+      # Create a UMAP plot to visualize the cleaned data with singlets only
+      seu_clean_plot <- DimPlot(seu_clean, pt.size = 1, label = TRUE,
+                                label.size = 5, reduction = "umap",
+                                group.by = "DF.classifications_0.2_0.01_366") + theme(aspect.ratio = 1)
+      
+      # Save the umap with only singlets into pdf file
+      plots(seu_clean_plot, paste0(sample, "_", sample_type, "_SeuCleanPlot.pdf"))
+      
+      # Save the final cleaned object as an RDS file
+      saveRDS(seu_clean, paste0(sample, "_", sample_type, "_SeuClean.rds"))
+    }
+  }
+  
+}
+# Call the function with your list of Seurat objects
+process_seurat_objects_all(seurat_objects)
+
+
+# Loop to read and stock the news files (after QC) in R
+for (sample in samples) {
+  for (sample_type in sample_types) {
+    #Read and rename the files
+    rds_file <- paste0(sample, "_", sample_type, "_SeuClean.rds")
+    assign(paste0(sample, "_", sample_type), readRDS(rds_file))
+  }
+}
+
+# Merging all files to make 1 object 
+merged <- merge (x= D1_APCenriched,
+                 y = c(D2_APCenriched, D3_APCenriched,D4_APCenriched,D5_APCenriched,
+                       D1_CD45depleted, D2_CD45depleted,D3_CD45depleted, D4_CD45depleted,D5_CD45depleted,
+                       D1_unenriched, D2_unenriched, D3_unenriched,D4_unenriched,D5_unenriched))
+# Putting the samples as identity in the object
+merged$orig.ident <- as.factor(merged$orig.ident)
+
+# Re-perfoming these steps on the final object
+data <- NormalizeData(merged)
+data <- FindVariableFeatures(data, selection.method = "vst", nfeatures = 2000)
+data <- ScaleData(data)
+data <- RunPCA(data)
+data <- RunUMAP(data, dims = 1:10)
+DimPlot(data, reduction = "umap", label = TRUE, label.size = 3.5, repel = TRUE)
+
+# Need to join the layers if not, impossible to run the clustering algorithm
+# Puts all the RNA of the samples together
+data[["RNA"]] <- JoinLayers(data[["RNA"]])
+
+# QC vizualisation with all samples
+VlnPlot(data, features = "nFeature_RNA", pt.size = 0) + NoLegend()
+VlnPlot(data, features = "nCount_RNA", pt.size = 0, y.max = 15000) + NoLegend()
+VlnPlot(data, features = "percent.mt", pt.size = 0) + NoLegend()
+
+#Saving the object to not redo the previous steps over again
+saveRDS(data, "obj_before_clusters_steps.rds")
+
+# Clusters
+## Finding the neighbors for the data using the first 10 dimensions
+data <- FindNeighbors(data, dims = 1:10)
+# Finding clusters in the data with a specified resolution of 2
+data <- FindClusters(data, resolution = 2)
+# Creating a UMAP plot of the clusters with labels
+DimPlot(data, reduction = "umap", label = T)
+# Finding all marker genes that are positively differentially expressed
+markers1 <- FindAllMarkers(data, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Grouping the markers by cluster and selecting the top 15 markers 
+list <- markers1 %>% 
+  group_by(cluster) %>% 
+  top_n(n = 15, wt = avg_log2FC)
+
+#save the object after integrating the layers and finding clusters 
+saveRDS(data, "FINAL_V2.rds") 
+
+# Creation of a list with markers genes for each population
+gene.sets <- list()
+gene.sets$B <- c("IGHA1", "MS4A1", "IGHG1", "VPREB3", "LY86", "IGHD", "MZB1", "CD79B", "ADAM28", "IGHM", "IGHG3", "VPREB1", "HLA-DQA1", 
+                 "TCL1A", "IGKC", "IGLL1", "CRIP1", "BIRC3", "FKBP11", "CD24", "MS4A1", "HLA-DQB1", "SSR4", "IGHM", "GPR183", "FCER2", 
+                 "SEC11C", "TNFRSF13B", "HLA-DRA", "DERL3", "GNG7", "JCHAIN", "BANK1", "CD22", 
+                 "XBP1", "RCSD1", "HLA-DPB1", "HLA-DQA1", "IGLC2", "AKAP12", "SMIM14", "LINC02446", "CD79A", "CD9", "BCL2A1", "RHOH", 
+                 "HERPUD1", "LAPTM5", "HLA-DRB1", "LY9", "IGLC3", "PCDH9", "BLK", "TMEM243", "COCH", "HLA-DPA1", 
+                 "IGHG2", "SSBP2", "PLP2", "HLA-DQA2", "PRDX4", "CD72", "HLA-DPA1", "HLA-DRB5", "IGHG4", "CD38", "CAPG", "CCR7", "IGLL5", 
+                 "CD74", "SCIMP", "BANK1", "ISG20", "TKT", "CD19", "PAX5", "CD3E", "CD3D", "IL7R")
+
+gene.sets$CD4 <- c("ISG15", "TNFRSF25", "TNFRSF1B", "DHRS3", "UBXN10-AS1", "ID3", "IFI6", "HIVEP3", "PRDX1", "IFI44L", "IFI44", "GBP1", 
+                   "GBP2", "DENND2D", "SRGAP2B", "S100A11", "SLAMF1", "SELL", "RGS1", "CENPF", "CHRM3-AS2", "RSAD2", "ID2", "BCL11A", "REL", 
+                   "TRABD2A", "DUSP2", "CYTIP", "STAT1", "CASP8", "CD28", "ICOS", "ADAM23", "SERPINE2", "SP100", "UBE2F", "PDCD1", "TGFBR2", 
+                   "TRAT1", "CD200", "GPR171", "TNFSF10", "TPRG1", "CLDN1", "PLAC8", "NFKB1", "NDST3", "HPGD", "ANKH", "IL6ST", "RHOBTB3",
+                   "IRF1", "EGR1", "CD74", "SERPINB9", "GFOD1", "HLA-F", "HLA-A", "IER3", "HLA-B", "SCML4", "AHI1", "TNFAIP3", "PHACTR2", 
+                   "SNX9", "RNASET2", "NCF1", "SAMD9L", "GIMAP7", "GIMAP4", "MSL3", "SCML1", "MAGEH1", "ITM2A", "CTSL", "CD40LG", "EGR3", "SDCBP", 
+                   "PTK2", "LY6E", "IFITM1", "IRF7", "TRIM22", "ZNF215", "CD6", "CORO1B", "CTTN", "SYTL2", "MAML2", "BIRC3", "CARD16", "KLF6", 
+                   "GATA3", "FAM107B", "CREM", "EGR2", "SRGN", "IFIT3", "IFIT1", "NFKB2", "CCND2", "CD27", "GAPDH", "CD4", "TPI1", "PTPN6", 
+                   "SLC2A3", "M6PR", "CD69", "NR4A1", "ELK3", "OAS1", "RILPL2", "ELF1", "EPSTI1", "TBC1D4", "GPR183", "RNASE6", "NFKBIA", 
+                   "ZFP36L1", "FOS", "SMAD3", "PKM", "NEIL1", "SOCS1", "MT2A", "P2RX5", "XAF1", "STAT5A", "CD79B", "TTC39C", "NFATC1", "SAMHD1", 
+                   "HELZ2", "GADD45B", "JUNB", "HSH2D", "KLF2", "BST2", "FXYD5", "NFKBID", "KCNK6", "RELB", "PTGIR", "MX2", "MX1", "CD3D", "CD3E")
+
+gene.sets$CD8 <- c("TTC24", "CD1E", "ZNF496", "LBH", "CD8A", "CD8B", "ITM2C", "FGFBP2", "RHOH", "CXXC5", "PRL", "LST1", "AOAH", "STAG3", "RFX3", 
+                   "AQP3", "CLIC3", "KCNQ1OT1", "CRTAM", "PRF1", "SEC31B", "KIAA1551", "ITGB7", "CHFR", "FAM173A", "SERPINF1", "PLXDC1", "CD7", 
+                   "SMIM24", "CD79A", "FTL", "CABIN1", "TIAM1")
+
+gene.sets$DC1 <- c("CLEC9A", "CD141", "XCR1", "HLA-DRA", "C10RF54", "HLA-DPA1", "CADM1", "CAMK2D", "IDO1", "CLNK", "ZNF366", "NDRG2", "SLAMF8", 
+                   "CD59", "ANPEP", "IRF8", "BAFT3")
+
+gene.sets$DC2 <-  c("CLEC10A", "CLEC7A", "CD1C", "ANXA1", "FCER1A", "S100A9", "VCAN", "LYZ", "FCGR2B", "CD1D", "SIRPA", "CD14")
+
+gene.sets$DNP <- c("IGLL1", "PTCRA", "FXYD2", "ATP6AP1L", "AC002454.1", "FAM45A", "MT2A", "PRPS2", "JCHAIN", "TRDC", "IL7R", "CDK6", "UHRF1", 
+                   "PCGF5", "GON4L", "SELL", "MAD2L2", "MAP1A", "AC011893.3", "ADGRG1", "MKI67")
+
+gene.sets$DNQ <- c("PTCRA", "MAL", "JCHAIN", "CD1E", "ADA", "UGT3A2", "LRRC28", "IL7R", "LIMS2", "RP11-404O13.5", "TRDC", "ATP6AP1L", "ID1", 
+                   "SELL", "GALNT2", "AC011893.3", "ADGRG1", "TFDP2", "MSI2", "CD7")
+
+gene.sets$DP_P <- c("CD4", "CD8A", "CD8B", "TCF7", "MKI67", "TOP2A")
+
+gene.sets$DP_Q <- c("CD4", "CD8A", "CD8B", "RAG1", "RAG2", "CD1A", "CD1E", "BCL2L1", "CD1B")
+
+gene.sets$Macro <-  c("RNASE1", "MS4A7", "C1QA", "C1QB", "LGMN", "C1QC", "APOE", "SLC40A1", "STAB1", "FOLR2", "DAB2", "AGR2", "TIMD4", 
+                      "MS4A6A", "MAF", "A2M", "APOC1", "F13A1", "AIF1", "CD68")
+
+gene.sets$NK <-  c("FCER1G", "MYOM2", "GNLY", "SPON2", "GZMB", "CLIC3", "PRF1", "TYROBP", "KLRB1", "NKG7", "IL2RB", "KLRF1", "GZMA", "CD7", 
+                   "CTSW", "CD247", "HOPX", "CCL4", "EFHD2", "FCGR3A", "PLAC8", "SRGN", "IGFBP7", "KLRD1", "METRNL", "JAK1", "CST7", "IFITM2", 
+                   "FGFBP2", "PTGDS", "CD56")
+
+gene.sets$T_agonist <-  c("UBE2F", "DHRS3", "MAGEH1", "ITM2A", "C1orf228", "SMS", "BACH2", "TNFRSF1B", "COTL1", "SERPINE2", "NREP", "LCP2", 
+                          "CD247", "LAT", "ITGAE", "VASP", "CREM", "CD40LG", "PHB", "CCND2")
+
+gene.sets$Treg <-  c("CD27", "IKZF2", "IKZF3", "TNFRSF9", "FOXP3", "CTLA4", "IL2RA", "ICOS", "PRDM1")
+
+gene.sets$Treg_diff <-  c("CD27", "IKZF2", "IKZF3", "FOXP3", "CTLA4", "CCR7", "ID3", "IKZF4", "GNG8", "PTGIR")
+
+gene.sets$cTEC <-  c("CCL25", "GNG11", "PRSS16", "PSMB11", "SCX", "PDLIM1", "COX7A1", "NUPR1", "DLK1", "HIC1", "PIK3R1", "GOLM1", "PRAP1",
+                     "GAA", "DACT1", "PAX1", "HLA-DRA", "KRT8", "FOXN1", "PSMB11")
+
+gene.sets$mTec <-  c("CCL19", "NTHL1", "KRT6A", "ANXA1","KRT15", "SLPI", "HEPACAM2","KRT19", "KRT17", "KRT19", "ANXA4","FN1", "TYW3", 
+                     "SFN", "KRT18", "SAA1", "SNCG", "SPINK5", "LRMP", "KRT14", "VIM", "LY6D", "KRT8", "PTGDS", "FGF17", "DEFB1", "RASSF6",
+                     "CLU", "CSTA", "PERP", "FOXI1", "KRT5", "HLA-DQA1", "S100A9", "EPCAM", "CH25H", "CALML3", "CALML5", "BMX", "KRT17", "TUBB2B", 
+                     "TACSTD2", "PBXIP1", "IGFBP5", "CCND1", "AQP3", "C11orf53","CXCL14", "CCDC28B", "KRT7", "MGST1","TSC22D1", "IL32", "ANXA1", 
+                     "TRPM4", "BST2", "HLA-DRA", "KRT1", "COLCA2", "CALML3", "HLA-DPA1", "KRT10", "CLDN4", "IFITM3", "INSM1", "C19orf33", "TPM1",
+                     "CPE", "TNFRSF4", "LGALS3", "AKR1B1","APOE", "NPB", "WFDC2", "IFI27", "INPP1", "CXCL17", "FAM3B", "AIRE")
+
+gene.sets$pDC <-  c("CLEC4C", "TLR7", "TCF4", "SPIB", "PTPRS", "PLAC8","LILRA4", "IRF7", "ITGAE", "IL3RA", "FAM129C", "CCR7", "CD300A", 
+                    "CD2AP", "BTK", "BLNK", "BLK", "GZMB", "SERPINF1", "ITM2C", "BCL11A", "MZB1", "DERL3", "JCHAIN", "IGJ")
+
+gene.sets$fibro <-  c("C7", "LUM", "TMSB15A", "DPT", "MGP", "TYMS", "PTN", "OGN", "RARRES2", "PTGDS", "FN1", "UBE2C",
+                      "RBP5", "IGFBP6", "PTN", "RSPO3", "COL1A2", "KIAA0101", "FAP", "COL14A1", "MAD2L1",
+                      "SPARCL1", "COL3A1", "TK1", "SRPX", "COL1A1", "SMC2", "HSPB6", "FBN1", "SMC4", "CCL2", "DCN", "ZWINT",
+                      "FXYD6", "ITM2A", "CENPK", "NR2F1", "CCDC80", "RNASEH2A","DBI", "CTSK", "TOP2A","SPRY1", "WISP2", "LSM4",
+                      "LITAF", "ID2", "GGH", "SPON2", "UBE2T","COLEC11", "FSTL1", "GINS2", "RUNX1T1", "FBLN2", "BIRC5",
+                      "RWDD1", "MFAP5", "CYR61", "PDGFRA")
+
+gene.sets$ery <-  c("HBG2", "HBA2", "HBA1", "HBB", "HBG1", "AHSP", "BLVRB", "HBM", "ALAS2", "FAM178B", "SLC25A37", "GYPB", "SNCA", 
+                    "GYPC", "GYPA", "APOC1", "KLF1", "HBZ", "FECH", "MYC", "CD36")
+
+gene.sets$endo <- c("PLVAP", "SPARCL1", "RNASE1", "NPDC1", "TM4SF1", "A2M", "RAMP2", "IFI27", "BCAM", "AQP1", "ACKR1", "PECAM1", "CD34", 
+                    "EMCN", "ESAM", "JAM2", "IFITM1", "CAV1", "ADGRL4", "EMP1", "VWF", "ACE", "CDH5")
+
+gene.sets$NKT <- c("GZMK", "NKG7", "CST7", "GZMM", "XCL1", "SAMD3", "CCL5", "GIMAP4", "ITM2C", "CD8A", "CLEC2B", "IL32", "TRGC1", "HSPD1", "TRDC")
+
+gene.sets$CD8aa <- c("CD8A", "CD5", "CD7", "CD28", "IKZF1", "GNG4", "IKZF2", "ZNF683", "MME", "PDCD1")
+
+# Calculate module enrichment scores with the genes in the list we did
+data <- AddModuleScore_UCell(
+  b,
+  features =gene.sets,
+  maxRank = 1500,
+  chunk.size = 1000,
+  BPPARAM = NULL,
+  ncores = 1,
+  storeRanks = FALSE,
+  w_neg = 1,
+  assay = NULL,
+  slot = "counts",
+  ties.method = "average",
+  force.gc = FALSE,
+  name = "_UCell"
+)
+
+# Vizualisation of specific genes in the dataset
+FeaturePlot(data, reduction = "umap", features = "CD5")
+
+#Subsetting the dataset with the clusters we identified 
+obj1 <- subset(x = data, idents = c("0", "1", "3", "4", "5", "6", "7", "8", "9", "10",
+                              "11", "14", "16", "17", "18","19", "20", "21", 
+                              "22", "23", "26", "27", "28", "31", "32", "35", 
+                              "36", "37", "39", "40", "41"))
+
+#Save the object
+saveRDS(obj1, "FINAL_OBJ_V3.rds")
+
+##Assign each cluster with its cell type 
+new_clusters_id <- c("DP(Q)", "DP(Q)", "CD8", "CD4", "CD4", "DP(Q)", "DP(Q)", 
+                     "CD8", "CD4", "Treg diff", "DP(Q)", "B cells", "DP(Q)", 
+                     "CD4", "CD4", "CD4", "B cells", "Endo", "cTec", "mTec", 
+                     "DC", "DP(P)", "Fibro",  "Treg", "DN", "B cells", 
+                     "Macrophages", "Ery", "NK", "CD4", "pDC")
+# Assign names to the clusters in the Seurat object
+names(new_clusters_id) <- levels(obj1)
+# Rename the clusters in the Seurat object using the defined cell type annotations
+obj1 <- RenameIdents(obj1, new_clusters_id)
+# Create a UMAP plot of the data with cluster labels 
+DimPlot(obj1, reduction = "umap", label = TRUE, pt.size = 0.3) + NoLegend()
+# Assign the cluster identities to a new column 'type' in the Seurat object
+obj1$type <- obj1@active.ident
+# Save the final object
+saveRDS(obj1, "obj_with_clusters_DONE.rds")
+
+# Subset of genes to realise the different heatmaps
+# Heatmap with T cells genes
+t_genes_hm <-  c("RAG1", "RAG2", "BCL2L1", "CD4", "CD8A", "CD8B", "CD3D",
+                 "CD3E", "IL7R", "LINC02446",  "CD40LG", "ITM2A", "CTSL", 
+                 "SELL", "GIMAP7", "FOXP3", "CTLA4", "IKZF4", "GNG8", "CD27",
+                 "MKI67", "TCF7", "CD1E", "CD1B", "ILRA2", "ICOS", "PTCRA",
+                 "TRDC")
+# Heatmap with immune cells other than T cells
+non_t_immune_hm <- c("CD19", "CD79A", "CD79B", 
+                     "CD141", "IRF8", "ANPEP", "BAFT3", "XCR1", "CLEC9A",
+                     "CLEC7A", "CLEC10A", "CD14",
+                     "CD68", "LMGN", "C1QA", "C1QB", "C1QC", "C1QE",
+                     "CD56", "GNLY", "KLRB1", "NKG7",
+                     "CLEC4A", "TCF4")
+# Heatmap with stromal cells
+non_t_stroma_hm <-  c("PECAM1", "CD34", "VWF", "ACE", "CDH5", "PLVAP",
+                      "CCL25", "KRT8", "FOXN1", "PSMB11",
+                      "AIRE", "KRT1", "KRT14", "KRT17", "KRT18",
+                      "PDGFRA", "FAP", "C7", "FBN1", "COLEC11",
+                      "CD36", "GYPA", "GYPB", "HBA1", "HBA2", "HBB")
+# Vizualisation of the heatmap
+DoHeatmap(obj1, features = t_genes_hm, size = 3)
+DoHeatmap(obj1, features = non_t_immune_hm, size = 3)
+DoHeatmap(obj1, features = non_t_stroma_hm, size = 3)
+
+#LIANA analysis of Lie and al data, processed previously
+#Grouping all SP4 cells into one cluster
+new_clusters_names <- c("DP", "DP", "CD8", "SP4", "SP4", "DP", "DP", 
+                        "CD8", "SP4", "SP4", "DP", "B cells", "DP", 
+                        "SP4", "SP4", "SP4", "B cells", "Endo", "cTec", "mTec", 
+                        "DC", "DP", "Fibro",  "SP4", "DN", "B cells", 
+                        "Macrophages", "Ery", "NK", "SP4", "pDC")
+names(new_clusters_names) <- levels(a)
+obj1 <- RenameIdents(a, new_clusters_names)
+DimPlot(obj1, reduction = "umap", label = TRUE, label.size = 2.5, repel = T) + NoLegend()
+
+# Subset of the dataset to keep only the populations of interest
+pop_of_int <- subset(x = obj1, idents = c("SP4", "B cells", "DC", "pDC", "Macrophages", "mTec", "cTec"))
+
+# Path of the package into the computer
+liana_path <- system.file(package = "liana")
+# Running the algorithm with several methods 
+res_pop_of_int <- liana_wrap(pop_of_int, method = c("natmi", "sca", "connectome", "logfc", "cellphonedb" ))
+
+# Robust rank aggregation 
+res_pop_of_int <- res_pop_of_int %>%
+  liana_aggregate()
+
+#Dot plot representation
+res_pop_of_int %>%
+  liana_dotplot(source_groups = c("B cells", "DC", "pDC", "mTec", "cTec"),
+                target_groups = c("Macrophages"),
+                ntop = 25) + NoLegend()
+
+#Chordplot representation
+p <- chord_freq(res_pop_of_int,
+                source_groups = c("B cells", "DC", "pDC", "Macrophages", "mTec", "cTec", "NK", "Fibro", "Endo", "Ery"),
+                target_groups = c("DP"),
+                cex = 0.7)
+
+# Same analysis but only with interactions involving the CD4 coreceptor
+mol <- "CD4"
+
+# Dataset filtering to keep only CD4
+new_obj <- subset(res_pop_of_int, receptor.complex == mol)
+
+#Dot plot representation
+new_obj %>%
+  liana_dotplot(source_groups = c("B cells", "DC", "pDC", "Macrophages", "mTec", "cTec"),
+                target_groups = c("SP4"),
+                ntop = 5)
+
+#Chordplot representation
+p_new_obj <- chord_freq(new_obj,
+                  source_groups = c("B cells", "DC", "pDC", "Macrophages", "mTec", "cTec", "NK", "Fibro", "Endo", "Ery"),
+                  target_groups = c("SP4"),
+                  cex = 0.7)
+
+# LIANA analysis with the team's dataset 
+# The Seurat object was already created for this dataset
+team_data <- readRDS("Merge_annotated.rds")
+
+# Using the Functionnal annotation as Identity
+Idents(object = team_data) <- "Functionnal"
+
+#UMAP representation of the dataset
+DimPlot(object = team_data, 
+        reduction = "umap",
+        label = TRUE, # Display names of clusters
+        label.size = 5, # Writing size
+        repel = TRUE) + NoLegend() # Avoid the writings to overlap with each other 
+
+#Grouping all SP4 cells into one cluster 
+new_clusters_names <- c("B Cells", "CD8aa", "Commited", "DC", "DC", "DC", "DP(P)", "DP(Q)", "ETP", "ILC3", "Macrophage", "MAIT", "NKT",
+                        "pDC", "Plasmocytes", "SP4", "SP8", "Specified", "T agonist", "TCRgd", "TP Blast", "SP4", "SP4", "TSP1", "TSP2")
+names(new_clusters_names) <- levels(team_data)
+team_data <- RenameIdents(team_data, new_clusters_names)
+
+# Subset of the dataset to keep only the populations of interest
+team_pop_of_int <- subset(x = team_data, idents = c("SP4", "B Cells", "DC", "pDC", "Macrophage"))
+
+# Path of the package into the computer
+liana_path <- system.file(package = "liana")
+# Running the algorithm with several methods 
+res_team_pop_of_int <- liana_wrap(team_pop_of_int, method = c("natmi", "sca", "connectome", "logfc", "cellphonedb" ))
+
+# Robust rank aggregation 
+res_team_pop_of_int <- res_team_pop_of_int %>%
+  liana_aggregate()
+
+#Dot plot representation
+res_team_pop_of_int %>%
+  liana_dotplot(source_groups = c("B Cells", "DC", "pDC", "Macrophage"),
+                target_groups = c("SP4"),
+                ntop = 25)
+
+#Chordplot representation
+p_team <- chord_freq(res_pop_of_int,
+                source_groups = c("B Cells", "DC", "pDC", "Macrophage"),
+                target_groups = c("SP4"),
+                cex = 0.7)
+
+# Same analysis but only with interactions involving the CD4 coreceptor
+mol <- "CD4"
+
+# Dataset filtering to keep only CD4
+new_team <- subset(res_team_pop_of_int, receptor.complex == mol)
+
+#Dot plot representation
+new_team %>%
+  liana_dotplot(source_groups = c("B Cells", "DC", "pDC", "Macrophage"),
+                target_groups = c("SP4"),
+                ntop = 25)
+
+#Chordplot representation
+p_new_team <- chord_freq(new_team,
+                  source_groups = c("B Cells", "DC", "pDC", "Macrophage"),
+                  target_groups = c("SP4"),
+                  cex = 0.7)
